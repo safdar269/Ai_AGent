@@ -1,105 +1,233 @@
-import streamlit as st
+import os
 import time
 from dataclasses import dataclass
-from typing import Dict, Any, List, Optional
+from typing import Any, Dict, List, Optional
 
-st.set_page_config(page_title="AI Incident Detection Agent", layout="wide")
+import joblib
+import numpy as np
+import pandas as pd
+import streamlit as st
 
-st.title("🛡️ AI Incident Detection Agent")
-st.markdown("Real-time telemetry monitoring, automated investigation, and triage.")
+st.set_page_config(page_title="AI Incident Detection Agent", page_icon="🛡️", layout="wide")
 
-# --- Models & Mock Data ---
+# =====================================================================
+# 1. LOAD ML MODEL ARTIFACT
+# =====================================================================
+@st.cache_resource
+def load_detection_model():
+    model_path = "detector_model.pkl"
+    if not os.path.exists(model_path):
+        import subprocess
+        with st.spinner("Training baseline model from dataset..."):
+            subprocess.run(["python", "train.py"], check=True)
+    return joblib.load(model_path)
+
+model_artifact = load_detection_model()
+ml_model = model_artifact["model"]
+feature_cols = model_artifact["feature_cols"]
+
+
+# =====================================================================
+# 2. CORE AGENT & DATA STRUCTURES
+# =====================================================================
 @dataclass
-class RawEvent:
+class NetworkEvent:
     event_id: str
-    user_id: str
-    ip_address: str
-    action: str
+    src_ip: str
+    account: str
+    failed_attempts: int
+    session_duration_sec: float
+    bytes_sent_kb: float
+    port_number: int
     timestamp: float
 
-class PerceptionFilter:
-    def __init__(self, failure_threshold: int = 3, window_seconds: int = 60):
-        self.failure_threshold = failure_threshold
-        self.window_seconds = window_seconds
-        self.history: List[RawEvent] = []
+    def to_feature_vector(self) -> np.ndarray:
+        return np.array([[
+            self.failed_attempts,
+            self.session_duration_sec,
+            self.bytes_sent_kb,
+            self.port_number
+        ]])
 
-    def evaluate(self, event: RawEvent) -> Optional[Dict[str, Any]]:
-        self.history.append(event)
-        current = event.timestamp
-        self.history = [e for e in self.history if current - e.timestamp <= self.window_seconds]
-        
-        failures = [e for e in self.history if e.ip_address == event.ip_address and e.action == "login_failed"]
-        if len(failures) >= self.failure_threshold:
-            return {
-                "alert_type": "BRUTE_FORCE_SUSPECTED",
-                "ip_address": event.ip_address,
-                "target_account": event.user_id,
-                "failure_count": len(failures),
-            }
-        return None
 
-class DetectionAgent:
-    IP_DB = {
-        "203.0.113.42": {"score": 95, "tag": "Tor Exit Node / Scanner"},
-        "192.168.1.10": {"score": 5, "tag": "Internal Range"},
+class ThreatIntelligenceContext:
+    """Mock external and internal telemetry databases."""
+    KNOWN_IP_INTEL = {
+        "198.51.100.22": {"threat_score": 92, "category": "Known Tor Exit Node / Scanner"},
+        "203.0.113.45": {"threat_score": 88, "category": "Reported Botnet IP (AbuseIPDB)"},
+        "192.168.1.50": {"threat_score": 2, "category": "Internal Corporate Range"},
+        "10.0.0.12": {"threat_score": 0, "category": "Internal Gateway"},
     }
 
-    def investigate(self, alert: Dict[str, Any]) -> Dict[str, Any]:
-        ip = alert["ip_address"]
-        rep = self.IP_DB.get(ip, {"score": 20, "tag": "Unknown"})
-        is_high_risk = rep["score"] >= 80 and alert["target_account"] in ["root", "admin"]
-        
+    PRIVILEGED_ACCOUNTS = {"root", "admin", "db_master", "security_admin"}
+
+    @classmethod
+    def lookup_ip(cls, ip: str) -> Dict[str, Any]:
+        return cls.KNOWN_IP_INTEL.get(ip, {"threat_score": 15, "category": "Unindexed External IP"})
+
+    @classmethod
+    def is_privileged_account(cls, account: str) -> bool:
+        return account.lower() in cls.PRIVILEGED_ACCOUNTS
+
+
+class RemediationAgent:
+    """Performs multi-step reasoning over the ML perception alerts."""
+
+    def __init__(self, context: type[ThreatIntelligenceContext]):
+        self.context = context
+
+    def investigate_incident(self, event: NetworkEvent, anomaly_score: float) -> Dict[str, Any]:
+        ip_intel = self.context.lookup_ip(event.src_ip)
+        is_privileged = self.context.is_privileged_account(event.account)
+
+        # Composite risk scoring
+        # Model decision function gives negative values for anomalies: lower = more anomalous
+        ml_severity = min(1.0, max(0.0, (0.2 - anomaly_score) * 2.5))
+        intel_severity = ip_intel["threat_score"] / 100.0
+
+        risk_score = (0.5 * ml_severity) + (0.5 * intel_severity)
+        if is_privileged:
+            risk_score = min(1.0, risk_score + 0.20)
+
+        # Decision thresholding
+        if risk_score >= 0.75:
+            verdict = "CRITICAL_ATTACK"
+            action = f"APPLY FIREWALL BLOCK (iptables -A INPUT -s {event.src_ip} -j DROP)"
+            action_type = "automated_block"
+        elif risk_score >= 0.45:
+            verdict = "SUSPICIOUS_ANOMALY"
+            action = "TRIGGER HUMAN REVIEW TICKET (Escalated to SecOps Slack)"
+            action_type = "quarantine"
+        else:
+            verdict = "BENIGN_NOISE"
+            action = "LOG AND CONTINUE MONITORING"
+            action_type = "allow"
+
         return {
-            "verdict": "CRITICAL_ATTACK" if is_high_risk else "LOW_RISK_ANOMALY",
-            "confidence": 0.98 if is_high_risk else 0.40,
-            "ip": ip,
-            "account": alert["target_account"],
-            "reputation": rep["tag"],
-            "threat_score": rep["score"],
-            "rationale": f"Account '{alert['target_account']}' targeted from IP {ip} flagged as '{rep['tag']}'."
+            "verdict": verdict,
+            "risk_score": round(risk_score * 100, 1),
+            "ml_anomaly_score": round(float(anomaly_score), 4),
+            "ip": event.src_ip,
+            "account": event.account,
+            "ip_category": ip_intel["category"],
+            "is_privileged": is_privileged,
+            "action": action,
+            "action_type": action_type,
+            "rationale": (
+                f"Perception ML flagged feature vector on port {event.port_number}. "
+                f"Originating IP {event.src_ip} classified as '{ip_intel['category']}'. "
+                f"Target account '{event.account}' has privileged status: {is_privileged}."
+            ),
         }
 
-# --- UI Controls ---
-col1, col2 = st.columns([1, 2])
 
-with col1:
-    st.subheader("Simulation Controls")
-    threshold = st.slider("Failed Attempts Threshold", min_value=2, max_value=5, value=3)
-    target_account = st.selectbox("Target Account", ["root", "alice", "admin"])
-    source_ip = st.selectbox("Source IP", ["203.0.113.42", "192.168.1.10", "198.51.100.22"])
-    trigger_btn = st.button("Simulate Attack Stream", type="primary")
+# =====================================================================
+# 3. STREAMLIT INTERFACE
+# =====================================================================
+st.title("🛡️ AI Incident Detection & Autonomous Triage Agent")
+st.markdown(
+    "Architecture: **Dataset-Trained Isolation Forest (Perception)** $\\rightarrow$ "
+    "**Reasoning Agent (Contextual Correlator)** $\\rightarrow$ "
+    "**Automated Mitigation Engine**"
+)
 
-with col2:
-    st.subheader("Live Telemetry & Agent Output")
-    if trigger_btn:
-        detector = PerceptionFilter(failure_threshold=threshold)
-        agent = DetectionAgent()
-        
-        st.info("Ingesting stream...")
+# Sidebar: Controls
+st.sidebar.header("🕹️ Simulation Engine")
+mode = st.sidebar.radio("Select Input Mode", ["Batch Attack Simulation", "Manual Event Injection"])
+
+agent = RemediationAgent(context=ThreatIntelligenceContext)
+
+if mode == "Batch Attack Simulation":
+    st.subheader("Automated Traffic Stream Evaluation")
+    st.caption("Streams a batch of standard network sessions mixed with targeted anomalous events.")
+
+    if st.button("Run Stream Ingestion", type="primary"):
+        # Predefined test stream
         now = time.time()
-        events = [
-            RawEvent(f"evt_{i}", target_account, source_ip, "login_failed", now + i)
-            for i in range(threshold)
+        test_stream = [
+            NetworkEvent("EVT-101", "192.168.1.50", "alice", 0, 150.0, 120.0, 443, now - 20),
+            NetworkEvent("EVT-102", "10.0.0.12", "bob", 1, 30.0, 45.0, 80, now - 15),
+            # Anomaly: Rapid brute force on port 22 with Tor node
+            NetworkEvent("EVT-103", "198.51.100.22", "root", 18, 2.5, 3500.0, 22, now - 10),
+            NetworkEvent("EVT-104", "192.168.1.50", "alice", 0, 400.0, 250.0, 443, now - 5),
+            # Anomaly: Unusual high data outbound on port 4444
+            NetworkEvent("EVT-105", "203.0.113.45", "db_master", 3, 5.0, 8900.0, 4444, now - 1),
         ]
-        
-        alert = None
-        for ev in events:
-            st.write(f"📥 `{ev.timestamp:.2f}` — User: **{ev.user_id}** | IP: `{ev.ip_address}` | Action: `{ev.action}`")
-            alert = detector.evaluate(ev)
 
-        if alert:
-            st.warning("⚠️ Perception threshold breached. Agent investigating...")
-            report = agent.investigate(alert)
-            
-            st.markdown("### 🧠 Agent Findings")
-            res_col1, res_col2 = st.columns(2)
-            res_col1.metric("Verdict", report["verdict"])
-            res_col2.metric("Confidence", f"{report['confidence'] * 100:.0f}%")
-            
-            st.write(f"**Threat Details:** {report['reputation']} (Score: {report['threat_score']}/100)")
-            st.write(f"**Rationale:** {report['rationale']}")
-            
-            if report["verdict"] == "CRITICAL_ATTACK":
-                st.error(f"🛑 Automated Mitigation Applied: `iptables -A INPUT -s {report['ip']} -j DROP`")
+        for event in test_stream:
+            features = event.to_feature_vector()
+            pred = ml_model.predict(features)[0]  # -1 = anomaly, 1 = normal
+            score = ml_model.decision_function(features)[0]
+
+            col1, col2 = st.columns([1, 2])
+            with col1:
+                st.markdown(f"**Event ID:** `{event.event_id}`")
+                st.write(f"IP: `{event.src_ip}` | Port: `{event.port_number}` | User: `{event.account}`")
+                st.write(f"Payload: `{event.bytes_sent_kb} KB` | Failed Logins: `{event.failed_attempts}`")
+
+            with col2:
+                if pred == -1:
+                    st.error(f"⚠️ **Tier 1 (ML Perception) Triggered**: Anomaly detected! (Score: {score:.3f})")
+                    with st.spinner("Agent investigating context and querying threat databases..."):
+                        report = agent.investigate_incident(event, score)
+
+                    # Display Agent Triage Card
+                    st.markdown(f"**Agent Verdict:** `{report['verdict']}` | **Risk Score:** `{report['risk_score']}%`")
+                    st.write(f"💡 *Rationale:* {report['rationale']}")
+
+                    if report["action_type"] == "automated_block":
+                        st.error(f"🛑 **Action Executed:** `{report['action']}`")
+                    else:
+                        st.warning(f"🔔 **Action Executed:** `{report['action']}`")
+                else:
+                    st.success(f"✅ **Tier 1 (ML Perception)**: Benign Traffic (Score: {score:.3f}) — No agent intervention required.")
+
+            st.divider()
+
+else:
+    st.subheader("Manual Event Parametric Test")
+    st.caption("Craft an individual network packet event to test edge-case agent behavior.")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        in_ip = st.selectbox("Source IP Address", ["198.51.100.22", "203.0.113.45", "192.168.1.50", "142.250.180.46"])
+        in_user = st.selectbox("Target Account", ["root", "admin", "db_master", "analyst_1", "guest"])
+        in_port = st.number_input("Port Number", min_value=1, max_value=65535, value=22)
+
+    with c2:
+        in_failed = st.slider("Failed Logins in Window", min_value=0, max_value=50, value=12)
+        in_duration = st.slider("Session Duration (seconds)", min_value=0.1, max_value=600.0, value=3.2)
+        in_bytes = st.number_input("Payload Exfiltrated / Sent (KB)", min_value=0.0, max_value=100000.0, value=4500.0)
+
+    if st.button("Evaluate Single Event", type="primary"):
+        manual_event = NetworkEvent(
+            event_id="MANUAL-TEST",
+            src_ip=in_ip,
+            account=in_user,
+            failed_attempts=in_failed,
+            session_duration_sec=in_duration,
+            bytes_sent_kb=in_bytes,
+            port_number=in_port,
+            timestamp=time.time(),
+        )
+
+        features = manual_event.to_feature_vector()
+        pred = ml_model.predict(features)[0]
+        score = ml_model.decision_function(features)[0]
+
+        st.markdown("### Evaluation Results")
+        r_col1, r_col2 = st.columns(2)
+
+        with r_col1:
+            st.metric("Tier 1 Perception Status", "ANOMALY FLAGGED" if pred == -1 else "BENIGN")
+            st.metric("Raw Model Decision Score", f"{score:.4f}")
+
+        with r_col2:
+            if pred == -1:
+                report = agent.investigate_incident(manual_event, score)
+                st.metric("Final Risk Severity", f"{report['risk_score']}%")
+                st.metric("Agent Action Verdict", report["verdict"])
+                st.info(f"**Rationale:** {report['rationale']}")
+                st.code(report["action"], language="bash")
             else:
-                st.info("ℹ️ Low severity: Ticket dispatched to human reviewer.")
+                st.success("The event falls well within the Gaussian parameters of standard traffic. Dropped silently.")
