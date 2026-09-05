@@ -1,7 +1,7 @@
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import joblib
 import numpy as np
@@ -10,17 +10,19 @@ import streamlit as st
 
 st.set_page_config(page_title="AI Incident Detection Agent", page_icon="🛡️", layout="wide")
 
+
 # =====================================================================
-# 1. LOAD ML MODEL ARTIFACT
+# 1. LOAD ML MODEL (IN-MEMORY FALLBACK - NO SUBPROCESS)
 # =====================================================================
 @st.cache_resource
 def load_detection_model():
     model_path = "detector_model.pkl"
     if not os.path.exists(model_path):
-        import subprocess
-        with st.spinner("Training baseline model from dataset..."):
-            subprocess.run(["python", "train.py"], check=True)
+        with st.spinner("Training baseline model from dataset for the first time..."):
+            from train import train_and_export_model
+            return train_and_export_model(model_path)
     return joblib.load(model_path)
+
 
 model_artifact = load_detection_model()
 ml_model = model_artifact["model"]
@@ -28,7 +30,7 @@ feature_cols = model_artifact["feature_cols"]
 
 
 # =====================================================================
-# 2. CORE AGENT & DATA STRUCTURES
+# 2. DATA STRUCTURES & THREAT INTELLIGENCE
 # =====================================================================
 @dataclass
 class NetworkEvent:
@@ -51,7 +53,6 @@ class NetworkEvent:
 
 
 class ThreatIntelligenceContext:
-    """Mock external and internal telemetry databases."""
     KNOWN_IP_INTEL = {
         "198.51.100.22": {"threat_score": 92, "category": "Known Tor Exit Node / Scanner"},
         "203.0.113.45": {"threat_score": 88, "category": "Reported Botnet IP (AbuseIPDB)"},
@@ -70,9 +71,10 @@ class ThreatIntelligenceContext:
         return account.lower() in cls.PRIVILEGED_ACCOUNTS
 
 
+# =====================================================================
+# 3. DETECTION AGENT
+# =====================================================================
 class RemediationAgent:
-    """Performs multi-step reasoning over the ML perception alerts."""
-
     def __init__(self, context: type[ThreatIntelligenceContext]):
         self.context = context
 
@@ -80,8 +82,6 @@ class RemediationAgent:
         ip_intel = self.context.lookup_ip(event.src_ip)
         is_privileged = self.context.is_privileged_account(event.account)
 
-        # Composite risk scoring
-        # Model decision function gives negative values for anomalies: lower = more anomalous
         ml_severity = min(1.0, max(0.0, (0.2 - anomaly_score) * 2.5))
         intel_severity = ip_intel["threat_score"] / 100.0
 
@@ -89,7 +89,6 @@ class RemediationAgent:
         if is_privileged:
             risk_score = min(1.0, risk_score + 0.20)
 
-        # Decision thresholding
         if risk_score >= 0.75:
             verdict = "CRITICAL_ATTACK"
             action = f"APPLY FIREWALL BLOCK (iptables -A INPUT -s {event.src_ip} -j DROP)"
@@ -122,7 +121,7 @@ class RemediationAgent:
 
 
 # =====================================================================
-# 3. STREAMLIT INTERFACE
+# 4. STREAMLIT UI
 # =====================================================================
 st.title("🛡️ AI Incident Detection & Autonomous Triage Agent")
 st.markdown(
@@ -131,7 +130,6 @@ st.markdown(
     "**Automated Mitigation Engine**"
 )
 
-# Sidebar: Controls
 st.sidebar.header("🕹️ Simulation Engine")
 mode = st.sidebar.radio("Select Input Mode", ["Batch Attack Simulation", "Manual Event Injection"])
 
@@ -142,21 +140,18 @@ if mode == "Batch Attack Simulation":
     st.caption("Streams a batch of standard network sessions mixed with targeted anomalous events.")
 
     if st.button("Run Stream Ingestion", type="primary"):
-        # Predefined test stream
         now = time.time()
         test_stream = [
             NetworkEvent("EVT-101", "192.168.1.50", "alice", 0, 150.0, 120.0, 443, now - 20),
             NetworkEvent("EVT-102", "10.0.0.12", "bob", 1, 30.0, 45.0, 80, now - 15),
-            # Anomaly: Rapid brute force on port 22 with Tor node
             NetworkEvent("EVT-103", "198.51.100.22", "root", 18, 2.5, 3500.0, 22, now - 10),
             NetworkEvent("EVT-104", "192.168.1.50", "alice", 0, 400.0, 250.0, 443, now - 5),
-            # Anomaly: Unusual high data outbound on port 4444
             NetworkEvent("EVT-105", "203.0.113.45", "db_master", 3, 5.0, 8900.0, 4444, now - 1),
         ]
 
         for event in test_stream:
             features = event.to_feature_vector()
-            pred = ml_model.predict(features)[0]  # -1 = anomaly, 1 = normal
+            pred = ml_model.predict(features)[0]
             score = ml_model.decision_function(features)[0]
 
             col1, col2 = st.columns([1, 2])
@@ -171,7 +166,6 @@ if mode == "Batch Attack Simulation":
                     with st.spinner("Agent investigating context and querying threat databases..."):
                         report = agent.investigate_incident(event, score)
 
-                    # Display Agent Triage Card
                     st.markdown(f"**Agent Verdict:** `{report['verdict']}` | **Risk Score:** `{report['risk_score']}%`")
                     st.write(f"💡 *Rationale:* {report['rationale']}")
 
@@ -230,4 +224,4 @@ else:
                 st.info(f"**Rationale:** {report['rationale']}")
                 st.code(report["action"], language="bash")
             else:
-                st.success("The event falls well within the Gaussian parameters of standard traffic. Dropped silently.")
+                st.success("The event falls well within the normal parameters of standard traffic. Dropped silently.")
